@@ -8,22 +8,22 @@
  * Heart Rate Measurement Char: 0x2A37
  * Body Sensor Location Char:   0x2A38
  */
-BLEService        hrms = BLEService(UUID16_SVC_HEART_RATE);
-BLECharacteristic hrmc = BLECharacteristic(UUID16_CHR_HEART_RATE_MEASUREMENT);
-BLECharacteristic bslc = BLECharacteristic(UUID16_CHR_BODY_SENSOR_LOCATION);
+static BLEService        hrms = BLEService(UUID16_SVC_HEART_RATE);
+static BLECharacteristic hrmc = BLECharacteristic(UUID16_CHR_HEART_RATE_MEASUREMENT);
+static BLECharacteristic bslc = BLECharacteristic(UUID16_CHR_BODY_SENSOR_LOCATION);
 
-BLEDis bledis;    // DIS (Device Information Service) helper class instance
-BLEBas blebas;    // BAS (Battery Service) helper class instance
+static BLEDis bledis;    // DIS (Device Information Service) helper class instance
+static BLEBas blebas;    // BAS (Battery Service) helper class instance
 
 uint32_t blinkyms;
 uint8_t  bps = 0;
 
 // Advanced function prototypes
-void setupAdv(void);
-void setupHRM(void);
-void connect_callback(void);
-void disconnect_callback(uint8_t reason);
-void cccd_callback(BLECharacteristic& chr, ble_gatts_evt_write_t* request);
+static void setupAdv(void);
+static void setupHRM(void);
+static void connect_callback(void);
+static void disconnect_callback(uint8_t reason);
+static void cccd_callback(BLECharacteristic& chr, ble_gatts_evt_write_t* request);
 
 void setup()
 {
