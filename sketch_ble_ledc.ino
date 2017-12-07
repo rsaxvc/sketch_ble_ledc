@@ -1,47 +1,60 @@
 #include <bluefruit.h>
+#include <Arduino.h>
 
-#define STATUS_LED  (17)
-#define BLINKY_MS   (2000)
+#define LED_MAX 255
+#define NUM_LED 2
 
-/* HRM Service Definitions
- * Heart Rate Monitor Service:  0x180D
- * Heart Rate Measurement Char: 0x2A37
- * Body Sensor Location Char:   0x2A38
- */
-static BLEService        hrms = BLEService(UUID16_SVC_HEART_RATE);
-static BLECharacteristic hrmc = BLECharacteristic(UUID16_CHR_HEART_RATE_MEASUREMENT);
-static BLECharacteristic bslc = BLECharacteristic(UUID16_CHR_BODY_SENSOR_LOCATION);
+/* LED Controller Service Definitions */
+static const BLEUuid LEDS_UUID((const uint8_t*)"RSAXVC|UUID|SLED" );//UUID for LED Service
+static const BLEUuid LEDI_UUID((const uint8_t*)"RSAXVC|UUID|ILED" );//UUID for LED Info
+static const BLEUuid LEDC_UUID((const uint8_t*)"RSAXVC|UUID|CLED" );//UUID for LED Control
+static BLEService        leds = BLEService(LEDS_UUID);
+static BLECharacteristic ledi = BLECharacteristic(LEDI_UUID);
+static BLECharacteristic ledc = BLECharacteristic(LEDC_UUID);
 
 static BLEDis bledis;    // DIS (Device Information Service) helper class instance
 static BLEBas blebas;    // BAS (Battery Service) helper class instance
 
-uint32_t blinkyms;
-uint8_t  bps = 0;
+static uint8_t leddata[NUM_LED];
 
 // Advanced function prototypes
 static void setupAdv(void);
-static void setupHRM(void);
-static void connect_callback(void);
-static void disconnect_callback(uint8_t reason);
-static void cccd_callback(BLECharacteristic& chr, ble_gatts_evt_write_t* request);
+static void setupLED(void);
+static void connect_callback(uint16_t conn_handle);
+static void disconnect_callback(uint16_t conn_handle, uint8_t reason);
 
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("Bluefruit52 HRM Example");
-  Serial.println("-----------------------");
+  Serial.println("RSAXVC.NET LED Controller");
 
-  // Setup LED pins and reset blinky counter
-  pinMode(STATUS_LED, OUTPUT);
-  blinkyms = millis();
+  //Need to blank LEDs to kick on underlying HWM hardware
+  analogWrite( LED_RED, 0 );
+  analogWrite( LED_BLUE, 0 );
+
+  //This is better for the MOSFETs.
+  //16MHz is...not so good for MOSFETs.
+  //Plus it makes a sweet flicker at high speed!
+  HwPWM0.setClockDiv(PWM_PRESCALER_PRESCALER_DIV_128); // freq = 128kHz
+  HwPWM1.setClockDiv(PWM_PRESCALER_PRESCALER_DIV_128); // freq = 128kHz
+  HwPWM2.setClockDiv(PWM_PRESCALER_PRESCALER_DIV_128); // freq = 128kHz
 
   // Initialise the Bluefruit module
-  Serial.println("Initialise the Bluefruit nRF52 module");
+  Serial.println("Initializing Bluefruit");
   Bluefruit.begin();
 
+  /* Setup the connection interval
+   * Set the min as low as    it can go -  7.5mS = 12 * 0.625mS
+   * Set the max as low as Apple can go - 15.0mS = 24 * 0.625mS
+   * For sweet FX, we need maximum throughputs.
+   * 
+   * Units of 0.625ms per LSB
+   */
+  Bluefruit.setConnInterval(12, 24);
+
   // Set the advertised device name (keep it short!)
-  Serial.println("Setting Device Name to 'Feather52 HRM'");
-  Bluefruit.setName("Feather52 HRM");
+  Serial.println("Setting Device Name");
+  Bluefruit.setName("LEDC1");
 
   // Set the connect/disconnect callback handlers
   Bluefruit.setConnectCallback(connect_callback);
@@ -49,167 +62,190 @@ void setup()
 
   // Configure and Start the Device Information Service
   Serial.println("Configuring the Device Information Service");
-  bledis.setManufacturer("Adafruit Industries");
-  bledis.setModel("Bluefruit Feather52");
+  bledis.setManufacturer("RSAXVC.NET");
+  bledis.setModel("LEDC1");
   bledis.begin();
 
   // Start the BLE Battery Service and set it to 100%
   Serial.println("Configuring the Battery Service");
   blebas.begin();
-  blebas.update(100);
+  blebas.write(100);
 
-  // Setup the Heart Rate Monitor service using
+  // Setup the LED service using
   // BLEService and BLECharacteristic classes
-  Serial.println("Configuring the Heart Rate Monitor Service");
-  setupHRM();
+  Serial.println("Configuring the LED Service");
+  setupLED();
 
   // Setup the advertising packet(s)
   Serial.println("Setting up the advertising payload(s)");
   setupAdv();
 
   // Start Advertising
-  Serial.println("Ready Player One!!!");
   Serial.println("\nAdvertising");
   Bluefruit.Advertising.start();
 }
 
 void setupAdv(void)
 {
+  // Advertising packet
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
 
-  // Include HRM Service UUID
-  Bluefruit.Advertising.addService(hrms);
+  // Include LED Service UUID
+  Bluefruit.Advertising.addService(leds);
 
-  // There isn't enough room in the advertising packet for the
-  // name so we'll place it on the secondary Scan Response packet
-  Bluefruit.ScanResponse.addName();
+  // Include Name
+  Bluefruit.Advertising.addName();
+  
+  /* Start Advertising
+   * - Enable auto advertising if disconnected
+   * - Interval:  fast mode = 20 ms, slow mode = 152.5 ms
+   * - Timeout for fast mode is 30 seconds
+   * - Start(timeout) with timeout = 0 will advertise forever (until connected)
+   * 
+   * For recommended advertising interval
+   * https://developer.apple.com/library/content/qa/qa1931/_index.html   
+   */
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.setInterval(32, 244);    // in unit of 0.625 ms
+  Bluefruit.Advertising.setFastTimeout(30);      // number of seconds in fast mode
 }
 
-void setupHRM(void)
+/**
+ * Callback when received new LED data
+ * @param chr
+ * @param data
+ * @param len
+ * @param offset
+ */
+void ledc_rxd_cb(BLECharacteristic& chr, uint8_t* data, uint16_t len, uint16_t offset)
 {
-  // Configure the Heart Rate Monitor service
-  // See: https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.service.heart_rate.xml
+  switch( len )
+  {
+    default:
+    case 2:
+      leddata[1] = data[1];
+      analogWrite( LED_RED, data[1] );
+    case 1:
+      leddata[0] = data[1];
+      analogWrite( LED_BLUE, data[0] );
+    case 0:
+      break;
+  }
+  ledc.write( (const void*)leddata, sizeof(leddata) );
+}
+
+
+
+void setupLED(void)
+{
+  // Configure the RSAXVC LED service
+  // See: 
   // Supported Characteristics:
   // Name                         UUID    Requirement Properties
   // ---------------------------- ------  ----------- ----------
-  // Heart Rate Measurement       0x2A37  Mandatory   Notify
-  // Body Sensor Location         0x2A38  Optional    Read
-  // Heart Rate Control Point     0x2A39  Conditional Write       <-- Not used here
-  hrms.begin();
+  // LED INFO                     0x????  Mandatory   Read
+  // LED CONTROL                  0x????  Mandatory   Read,WriteNoResp
+  leds.begin();
 
   // Note: You must call .begin() on the BLEService before calling .begin() on
   // any characteristic(s) within that service definition.. Calling .begin() on
   // a BLECharacteristic will cause it to be added to the last BLEService that
   // was 'begin()'ed!
 
-  // Configure the Heart Rate Measurement characteristic
-  // See: https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.characteristic.heart_rate_measurement.xml
-  // Permission = Notify
-  // Min Len    = 1
-  // Max Len    = 8
-  //    B0      = UINT8  - Flag (MANDATORY)
-  //      b5:7  = Reserved
-  //      b4    = RR-Internal (0 = Not present, 1 = Present)
-  //      b3    = Energy expended status (0 = Not present, 1 = Present)
-  //      b1:2  = Sensor contact status (0+1 = Not supported, 2 = Supported but contact not detected, 3 = Supported and detected)
-  //      b0    = Value format (0 = UINT8, 1 = UINT16)
-  //    B1      = UINT8  - 8-bit heart rate measurement value in BPM
-  //    B2:3    = UINT16 - 16-bit heart rate measurement value in BPM
-  //    B4:5    = UINT16 - Energy expended in joules
-  //    B6:7    = UINT16 - RR Internal (1/1024 second resolution)
-  hrmc.setProperties(CHR_PROPS_NOTIFY);
-  hrmc.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
-  hrmc.setFixedLen(2);
-  hrmc.setCccdWriteCallback(cccd_callback);  // Optionally capture CCCD updates
-  hrmc.begin();
-  uint8_t hrmdata[2] = { 0b00000110, 0x40 }; // Set the characteristic to use 8-bit values, with the sensor connected and detected
-  hrmc.notify(hrmdata, 2);                   // Use .notify instead of .write!
-
-  // Configure the Body Sensor Location characteristic
-  // See: https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.characteristic.body_sensor_location.xml
+  // Configure the LED Info characteristic
   // Permission = Read
   // Min Len    = 1
   // Max Len    = 1
-  //    B0      = UINT8 - Body Sensor Location
-  //      0     = Other
-  //      1     = Chest
-  //      2     = Wrist
-  //      3     = Finger
-  //      4     = Hand
-  //      5     = Ear Lobe
-  //      6     = Foot
-  //      7:255 = Reserved
-  bslc.setProperties(CHR_PROPS_READ);
-  bslc.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
-  bslc.setFixedLen(1);
-  bslc.begin();
-  bslc.write(2);    // Set the characteristic to 'Wrist' (2)
+  //This tells you how many LEDs there are. That is all.
+  ledi.setProperties(CHR_PROPS_READ);
+  ledi.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  ledi.setFixedLen(1);
+  ledi.begin();
+  static const uint8_t leddata = NUM_LED;
+  ledi.write(&leddata, sizeof(leddata));
+
+  // Configure the LED Control characteristic
+  // See: 
+  // Permission = Read, Write No Response
+  // Min Len    = 1
+  // Max Len    = No limit
+  // Each byte corresponds to the level set for an LED.
+  // You can read it to see what they're set to.
+  // But it's more likely you'll want to write very quickly to change them over time.
+  ledc.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE_WO_RESP);
+  ledc.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  ledc.setWriteCallback(ledc_rxd_cb);
+  ledc.write( (const void*)leddata, sizeof(leddata) );
+  
+  ledc.setFixedLen(NUM_LED);
+  ledc.begin();
+  ledc.write(0);
 }
 
-void connect_callback(void)
+void connect_callback(uint16_t conn_handle)
 {
-  Serial.println("Connected");
+  char central_name[32] = { 0 };
+  Bluefruit.Gap.getPeerName(conn_handle, central_name, sizeof(central_name));
+
+  Serial.print("Connected to ");
+  Serial.println(central_name);
+
+  analogWrite( LED_RED, 0 );
+  analogWrite( LED_BLUE, 0 );
 }
 
-void disconnect_callback(uint8_t reason)
+void disconnect_callback(uint16_t conn_handle, uint8_t reason)
 {
+  (void) conn_handle;
   (void) reason;
 
   Serial.println("Disconnected");
+  memset(leddata,0x00,sizeof(leddata));
+  analogWrite( LED_RED, 0 );
+  analogWrite( LED_BLUE, 0 );
   Serial.println("Advertising!");
-}
-
-void cccd_callback(BLECharacteristic& chr, uint16_t cccd_value)
-{
-    // Display the raw request packet
-    Serial.print("CCCD Updated: ");
-    //Serial.printBuffer(request->data, request->len);
-    Serial.print(cccd_value);
-    Serial.println("");
-
-    // Check the characteristic this CCCD update is associated with in case
-    // this handler is used for multiple CCCD records.
-    if (chr.uuid == hrmc.uuid) {
-        if (chr.notifyEnabled()) {
-            Serial.println("Heart Rate Measurement 'Notify' enabled");
-        } else {
-            Serial.println("Heart Rate Measurement 'Notify' disabled");
-        }
-    }
 }
 
 void loop()
 {
-  // Blinky!
-  if (blinkyms+BLINKY_MS < millis()) {
-    blinkyms = millis();
-    digitalToggle(STATUS_LED);
-
-    if (Bluefruit.connected()) {
-      uint8_t hrmdata[2] = { 0b00000110, bps++ };           // Sensor connected, increment BPS value
-      err_t resp = hrmc.notify(hrmdata, sizeof(hrmdata));   // Note: We use .notify instead of .write!
-
-      // This isn't strictly necessary, but you can check the result
-      // of the .notify() attempt to see if it was successful or not
-      switch (resp) {
-        case ERROR_NONE:
-          // Value was written correctly!
-          Serial.print("Heart Rate Measurement updated to: "); Serial.println(bps);
-          break;
-        case NRF_ERROR_INVALID_PARAM:
-          // Characteristic property not set to 'Notify'
-          Serial.println("ERROR: Characteristic 'Property' not set to Notify!");
-          break;
-        case NRF_ERROR_INVALID_STATE:
-          // Notify bit not set in the CCCD or not connected
-          Serial.println("ERROR: Notify not set in the CCCD or not connected!");
-          break;
-        default:
-          // Unhandled error code
-          Serial.print("ERROR: Ox"); Serial.println(resp, HEX);
-          break;
-      }
-    }
+  digitalToggle(LED_RED);
+  
+  if ( Bluefruit.connected() ) {
+    // Just wait for updates to come over BLE
+    delay(1000);
   }
+  else     // Apply some UI Juice
+  {
+   static uint32_t val = 0;
+   static int8_t dir = 1;
+   analogWrite( LED_BLUE, val );
+   analogWrite( LED_RED, LED_MAX - val );
+   delay(1);
+   val+=dir;
+   if( val == LED_MAX ) dir = -1;
+   else if( val == 0 ) dir = 1;
+  }
+}
+
+/**
+ * RTOS Idle callback is automatically invoked by FreeRTOS
+ * when there are no active threads. E.g when loop() calls delay() and
+ * there is no bluetooth or hw event. This is the ideal place to handle
+ * background data.
+ * 
+ * NOTE: FreeRTOS is configured as tickless idle mode. After this callback
+ * is executed, if there is time, freeRTOS kernel will go into low power mode.
+ * Therefore waitForEvent() should not be called in this callback.
+ * http://www.freertos.org/low-power-tickless-rtos.html
+ * 
+ * WARNING: This function MUST NOT call any blocking FreeRTOS API 
+ * such as delay(), xSemaphoreTake() etc ... for more information
+ * http://www.freertos.org/a00016.html
+ */
+void rtos_idle_callback(void)
+{
+  // Don't call any other FreeRTOS blocking API()
+  // Perform background task(s) here
+    __asm volatile( "wfi" );
 }
